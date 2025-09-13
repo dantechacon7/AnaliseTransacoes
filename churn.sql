@@ -1,41 +1,46 @@
-/* Pergunta: Crie uma query que identifique os clientes que completaram 28 dias sem transacionar, agrupado por mês. 
-A visão deve incluir ref_month e número de clientes que não realizaram transações nos últimos 28 dias (agrupados por mês) */
+/* Pergunta: Crie uma query que mostre o TPV rolling 7 para cada dia na tabela de transações baseada na ‘transaction_date’. 
+A visão deve incluir ref_date, soma do tpv nos últimos 7 dias e número de clientes ativos nos últimos 7 dias. */
 
-/* Comentários sobre otimização e performance do código: 
-Novamente, adotamos uma cte para conceder mais clareza na leitura e facilidadena manutenção da query, assim como, 
-o outer join é trazido novamente como o left join, trazendo meses referenciais, mesmo sem transações dos clientes - registro de atividade. */
+/* Comentários sobre otimização do código: 
+Foram utilizadas ctes para calcular rolling_tpv_7 e active_customers_7 separadamente, evitando 
+repetir os cálculos para cada linha de cada table. O join utilizado foi o LEFT JOIN, para garantir que todas as datas de t1 sejam 
+consideradas, mesmo que não haja correspondência em t2, o que pode ser ajustado dependendo do objetivo (haver nulidade nos resultados ou não).
+Apesar de um inner join ser mais eficiente que um outer join, principalmente pra uma base de 20M de linhas, se usássemos o inner,
+os resultados excluiriam datas referenciais que não têm dados correspondentes de transações nos últimos 7 dias.*/
 
-/* Inicialmente, vamos modificar a formatação das datas de transações, trazendo os valores para o primeiro dia do mês e definindo-o 
-como ref_month. Isso possibilita o agrupamento dos valores por mês. */
+/* Detalhamento das linhas de código: 
+No primeiro momento, definimos a data de referência para ser trazida no resultado da consulta, a qual é atribuída pela data da transação, 
+de acordo com o intervalos que definirmos na subquery. Após isso, calculamos o tpv para as transações dos últimos 7 dias. 
+Para fins de documentação mais clara, o date_add surge como uma opção para tornar a janela móvel de dias mais explícita na consulta: 
+'INTERVAL 6 DAY' que seria um intervalo de 6 dias entre uma info e outra. */
 
-WITH date_ref_monthly AS (
-SELECT DISTINCT 
-DATE_FORMAT(transaction_date, '%Y-%m-01') AS ref_month --Date_format em ambientes de teste como sqlite não serão lidos (vale trocar para strftime), mas em gcp pode ser usado.
-FROM transactions
-
-), 
- /* Nesse momento, os clientes distintos em situação de churn são contabilizados e agrupados por mês. Repare que é utilizado um left join com 
-transactions t e drm.ref_month, dando à consulta a possibilidade de trazer um mês de referência, mesmo que não existam registros de 
-transações. Junto a esse join, foi definido um filtro que puxa valores nulos de transações no intervalo de referência, ou seja, clientes 
-em churn aqueles que não tiveram transações no intervalo de 28 dias. */
+WITH rolling_tpv AS (
+  SELECT t1.transaction_date AS ref_date,
+    SUM(t2.transaction_amount) AS rolling_tpv_7
+  FROM transactions t1
+  LEFT JOIN transactions t2 ON t2.transaction_date 
+  BETWEEN t1.transaction_date AND DATE_ADD(t1.transaction_date, INTERVAL 6 DAY)
+  GROUP BY t1.transaction_date
+), active_customers AS (
+  SELECT t1.transaction_date AS ref_date,
+    COUNT(DISTINCT t2.customer_id) AS active_customers_7
+  FROM transactions t1
+  LEFT JOIN transactions t2 ON t2.transaction_date 
+  BETWEEN t1.transaction_date AND DATE_ADD(t1.transaction_date, INTERVAL 6 DAY) 
+  /*em alguns ambientes de teste como sqlite, o date_add não é aceito, vale trocar para um 'date' com a soma do intervalo de dias*/
+  GROUP BY t1.transaction_date 
+  )
   
-monthly_churned_customers AS (
-   
 SELECT 
-drm.ref_month,
-COUNT(DISTINCT t.customer_id) AS churned_customers
-FROM date_ref_monthly drm
-LEFT JOIN transactions t ON DATE_FORMAT(t.transaction_date, '%Y-%m-01') <= drm.ref_month 
-AND t.transaction_date > DATE_SUB(drm.ref_month, INTERVAL 28 DAY) 
-AND t.transaction_date <= drm.ref_month 
+  ref_date,
+  rolling_tpv_7,
+  active_customers_7
+FROM rolling_tpv rtp
+LEFT JOIN active_customers ac
+ON rtp.ref_date = ac.ref_date 
+ORDER BY ref_date DESC;
 
-WHERE t.customer_id IS NULL 
-GROUP BY drm.ref_month
-)
-SELECT ref_month, churned_customers
-FROM monthly_churned_customers
-ORDER BY ref_month DESC;
-
-/* Por fim, os dados de mês referencial a clientes em churn (sem transacionar por +28 dias) são ordenados por mês e trazidos em DESC, 
-ou seja, do mais recente para o mais antigo. Como dito anteriormente, em outro notebook, isso nos possibilita uma gestão mais eficiente 
-dos dados em relatórios de visualização, pois ao definir limite de rows, é difícil haver limitação de dados de um mesmo mês de referência. */
+/* É interessante notar também, que ao ordenarmos por ref_date DESC, trazemos as informações mais recentes no topo, e as mais antigas depois.
+No uso dessa query em ferramentas como looker datastudio e/ou google sheets, por exemplo, em que integraríamos a consulta via BigQuery, 
+conseguimos trazer um limite de rows menor, deixar a visualização mais leve, e trazer dados mais recentes - com maior relevância numa 
+análise do dia a dia - para o topo do dashboard. Um limit de rows no código também seria uma alternativa para tornar o código mais leve. */
